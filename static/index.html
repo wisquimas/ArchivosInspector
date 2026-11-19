@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Archivos Inspector</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>Archivos Inspector</h1>
+      <p>Mapa de espacio al estilo WinDirStat, para recorrerlo en 3D. Solo lectura. Creado por Wisquimas.</p>
+    </div>
+    <div class="pathbox">
+      <input id="path" type="text" spellcheck="false" autocomplete="off" aria-label="Carpeta a analizar">
+      <button id="scanBtn" class="primary" type="button">Analizar carpeta</button>
+      <button id="demoBtn" type="button">Ver ejemplo</button>
+      <button id="cancelBtn" type="button" disabled>Cancelar</button>
+      <button id="curveBtn" type="button" aria-expanded="false" aria-controls="curvePanel" title="Configurar curva de altura" aria-label="Configurar curva de altura">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false">
+          <path fill="currentColor" d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.6-.22l-2.39.96a7.2 7.2 0 0 0-1.63-.94l-.36-2.54a.5.5 0 0 0-.5-.42h-3.84a.5.5 0 0 0-.5.42l-.36 2.54c-.58.23-1.12.54-1.63.94l-2.39-.96a.5.5 0 0 0-.6.22L2.71 8.84a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.13.23.4.32.64.22l2.39-.96c.5.4 1.05.72 1.63.94l.36 2.54c.05.24.25.42.5.42h3.84c.25 0 .46-.18.5-.42l.36-2.54c.58-.22 1.12-.54 1.63-.94l2.39.96c.24.1.51 0 .64-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/>
+        </svg>
+      </button>
+    </div>
+    <p id="status" role="status">Elegí una carpeta o abrí el ejemplo.</p>
+    <div id="curvePanel" class="curve-panel" hidden role="dialog" aria-labelledby="curveTitle">
+      <div class="curve-head">
+        <h2 id="curveTitle">Curva de antigüedad</h2>
+        <button id="curveClose" type="button" aria-label="Cerrar panel">×</button>
+      </div>
+      <p id="curveModeNote" class="muted"></p>
+      <p class="muted curve-lead">La altura crece con los días. La linealidad mezcla la curva logarítmica con una recta hasta el horizonte.</p>
+      <label class="curve-field">
+        <span>Altura mínima</span>
+        <input id="curveMin" type="number" step="any" value="0.45" inputmode="decimal" autocomplete="off">
+      </label>
+      <label class="curve-field">
+        <span>Altura máxima</span>
+        <input id="curveMax" type="number" step="any" value="14.45" inputmode="decimal" autocomplete="off">
+      </label>
+      <label class="curve-field">
+        <span>Linealidad</span>
+        <span class="curve-line">
+          <input id="curveLine" type="range" min="0" max="1" step="0.01" value="0" aria-valuemin="0" aria-valuemax="1" aria-label="Linealidad">
+          <input id="curveLineNum" type="number" min="0" max="1" step="0.01" value="0" inputmode="decimal" autocomplete="off" aria-label="Linealidad, número">
+        </span>
+        <span class="muted curve-hint">0 logarítmica · 1 lineal</span>
+      </label>
+      <label class="curve-field">
+        <span>Horizonte (días)</span>
+        <input id="curveHorizon" type="number" min="1" step="1" value="2920" inputmode="numeric" autocomplete="off">
+        <span class="muted curve-hint">Día en el que se alcanza la altura máxima.</span>
+      </label>
+      <p id="curveError" class="curve-error" role="alert" hidden></p>
+      <div class="curve-actions">
+        <button id="curveReset" type="button">Restablecer</button>
+      </div>
+    </div>
+  </header>
+
+  <div id="layout">
+    <aside class="panel" id="treePanel">
+      <h2>Carpetas</h2>
+      <div id="tree" role="tree" aria-label="Árbol de carpetas del análisis"></div>
+    </aside>
+
+    <aside class="panel" id="left">
+      <section>
+        <div class="section-head">
+          <h2>Carpeta</h2>
+          <button id="browseUp" type="button">Subir</button>
+        </div>
+        <div id="quick" class="quick"></div>
+        <div id="dirs"></div>
+      </section>
+      <section>
+        <h2>En esta vista</h2>
+        <p id="summary">Todavía no hay un mapa.</p>
+        <div id="list"></div>
+      </section>
+      <section>
+        <h2>Lo que más ocupa</h2>
+        <div id="top"></div>
+      </section>
+    </aside>
+
+    <main id="stage">
+      <canvas id="view" tabindex="0" aria-label="Ciudad 3D de archivos"></canvas>
+      <div id="crumb"></div>
+      <div id="tooltip" hidden></div>
+      <div id="crosshair" hidden></div>
+      <p id="hint">Clic selecciona. Doble clic entra. Rueda acerca. Flechas desplazan si el mapa tiene el foco. Arrastrar gira.</p>
+    </main>
+
+    <aside class="panel" id="right">
+      <section>
+        <h2>Propiedades</h2>
+        <div id="props"><p class="muted">Seleccioná un bloque.</p></div>
+        <div id="actions"></div>
+      </section>
+      <section>
+        <h2>Vista</h2>
+        <div id="views" class="chips">
+          <button type="button" data-view="orbit" aria-pressed="true">Órbita</button>
+          <button type="button" data-view="top" aria-pressed="false">Cenital</button>
+          <button type="button" data-view="walk" aria-pressed="false">Caminar</button>
+        </div>
+        <div id="heights" class="chips">
+          <button type="button" data-height="age" aria-pressed="true">Altura: antigüedad</button>
+          <button type="button" data-height="count" aria-pressed="false">Altura: cantidad</button>
+          <button type="button" data-height="flat" aria-pressed="false">Altura pareja</button>
+        </div>
+        <p id="heightHelp" class="muted">Más alto significa más antiguo. Un archivo usa su fecha; una carpeta cerrada, el archivo interno más viejo. La superficie sigue siendo el tamaño en bytes.</p>
+      </section>
+      <section>
+        <h2>Filtros</h2>
+        <div id="chips" class="chips">
+          <button type="button" class="chip" data-kind="all" aria-pressed="true">Todo</button>
+          <button type="button" class="chip" data-kind="video" aria-pressed="false">Videos</button>
+          <button type="button" class="chip" data-kind="image" aria-pressed="false">Imágenes</button>
+          <button type="button" class="chip" data-kind="audio" aria-pressed="false">Audio</button>
+          <button type="button" class="chip" data-kind="document" aria-pressed="false">Documentos</button>
+          <button type="button" class="chip" data-kind="code" aria-pressed="false">Código</button>
+          <button type="button" class="chip" data-kind="archive" aria-pressed="false">Comprimidos</button>
+          <button type="button" class="chip" data-kind="executable" aria-pressed="false">Ejecutables</button>
+          <button type="button" class="chip" data-kind="dup" aria-pressed="false">Duplicados</button>
+          <button type="button" class="chip" data-kind="old" aria-pressed="false">Antiguos</button>
+        </div>
+        <label id="ageLabel" hidden>Más de <input id="ageDays" type="number" min="1" max="36500" value="365"> días</label>
+        <input id="query" type="search" placeholder="Buscar por nombre" aria-label="Buscar por nombre">
+      </section>
+      <section>
+        <h2>Mapa 2D</h2>
+        <canvas id="map" width="300" height="220" aria-label="Mapa de bloques"></canvas>
+        <div id="legend"></div>
+        <p id="disk" class="muted"></p>
+        <p id="note" class="muted"></p>
+      </section>
+    </aside>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/vendor/three.module.js"
+    }
+  }
+  </script>
+  <script type="module" src="/main.js"></script>
+</body>
+</html>
