@@ -50,6 +50,7 @@ const pathInput = document.querySelector("#path");
 const scanBtn = document.querySelector("#scanBtn");
 const demoBtn = document.querySelector("#demoBtn");
 const cancelBtn = document.querySelector("#cancelBtn");
+const debugBtn = document.querySelector("#debugBtn");
 const statusEl = document.querySelector("#status");
 const quickEl = document.querySelector("#quick");
 const dirsEl = document.querySelector("#dirs");
@@ -85,6 +86,13 @@ const curveErrorEl = document.querySelector("#curveError");
 const curveModeNote = document.querySelector("#curveModeNote");
 const curveReset = document.querySelector("#curveReset");
 const mapCtx = map.getContext("2d");
+const loadingOverlay = document.querySelector("#loadingOverlay");
+const slowScan = new URLSearchParams(window.location.search).get("slowScan") === "1";
+
+const scanUi = {
+  lastPartialSeq: 0,
+  debugReady: false,
+};
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0e1318);
@@ -423,7 +431,18 @@ function styleKey(node) {
   return node.category || "other";
 }
 
+function setLoading(on, detail = "") {
+  if (on) {
+    loadingOverlay.hidden = false;
+    loadingOverlay.textContent = detail ? `Cargando… ${detail}` : "Cargando…";
+  } else {
+    loadingOverlay.hidden = true;
+    loadingOverlay.textContent = "Cargando…";
+  }
+}
+
 function applyResult(result) {
+  setLoading(false);
   linkParents(result.root, null);
   state.byId = new Map();
   indexTree(result.root);
@@ -444,10 +463,62 @@ function applyResult(result) {
   render({ frame: true });
 }
 
+function applyPartial(partial, options = {}) {
+  if (!partial?.root) return;
+  const keepPath = state.current?.path;
+  const keepSelected = state.selected?.path || state.selected?.name;
+  linkParents(partial.root, null);
+  state.byId = new Map();
+  indexTree(partial.root);
+  state.result = partial;
+  state.current = (keepPath && [...state.byId.values()].find((n) => n.path === keepPath)) || partial.root;
+  if (!state.current?.dir) state.current = partial.root;
+  state.selected = keepSelected
+    ? [...state.byId.values()].find((n) => n.path === keepSelected || n.name === keepSelected) || null
+    : null;
+  noteEl.textContent = partial.note || "Vista parcial mientras se analiza…";
+  const entries = visibleEntries(state.current);
+  drawCrumb();
+  drawTree();
+  drawList(entries);
+  drawTop();
+  drawProps();
+  drawLegend();
+  buildCity(entries);
+  drawMap();
+  if (options.frame) frameCity();
+  placeHighlight();
+}
+
 function setBusy(busy) {
   scanBtn.disabled = busy;
   demoBtn.disabled = busy;
   cancelBtn.disabled = !busy;
+  if (busy) scanUi.debugReady = true;
+  debugBtn.disabled = !scanUi.debugReady;
+}
+
+function debugStamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+async function downloadDebug() {
+  try {
+    const report = await readJson(await fetch("/api/scan/debug"));
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ArchivosInspector-debug-${debugStamp()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    statusEl.textContent = error.message || "No se pudo descargar el diagnóstico.";
+  }
 }
 
 async function loadBrowse(path) {
@@ -467,9 +538,25 @@ async function loadBrowse(path) {
       .join("") + extra;
 }
 
+function phaseLabel(phase) {
+  if (phase === "measuring") return "midiendo carpeta";
+  if (phase === "hashing") return "duplicados";
+  if (phase === "scanning") return "";
+  return "";
+}
+
+function loadingDetail(scan) {
+  const phase = phaseLabel(scan.phase);
+  if (phase) return phase;
+  if (scan.files > 0) return `${formatCount(scan.files)} archivos`;
+  return "";
+}
+
 async function scanPath(path) {
   setBusy(true);
-  statusEl.textContent = "Analizando…";
+  scanUi.lastPartialSeq = 0;
+  setLoading(true);
+  statusEl.textContent = "Cargando…";
   try {
     await readJson(await fetch("/api/scan", {
       method: "POST",
@@ -478,6 +565,7 @@ async function scanPath(path) {
     }));
   } catch (error) {
     setBusy(false);
+    setLoading(false);
     statusEl.textContent = error.message;
     return;
   }
@@ -489,12 +577,22 @@ async function poll() {
   try {
     const scan = await readJson(await fetch("/api/scan"));
     if (scan.state === "running") {
+      const detail = loadingDetail(scan);
+      setLoading(true, detail);
       const where = scan.current ? ` · ${scan.current}` : "";
-      statusEl.textContent = `Analizando ${formatCount(scan.files)} archivos, ${formatBytes(scan.bytes)}${where}`;
+      statusEl.textContent = detail
+        ? `Cargando… ${detail} · ${formatCount(scan.files)} archivos, ${formatBytes(scan.bytes)}${where}`
+        : `Cargando… ${formatCount(scan.files)} archivos, ${formatBytes(scan.bytes)}${where}`;
+      if (scan.partial_seq > scanUi.lastPartialSeq && scan.partial) {
+        const first = scanUi.lastPartialSeq === 0;
+        scanUi.lastPartialSeq = scan.partial_seq;
+        applyPartial(scan.partial, { frame: first });
+      }
       pollTimer = setTimeout(poll, 400);
       return;
     }
     setBusy(false);
+    setLoading(false);
     if (scan.state === "done") {
       applyResult(await readJson(await fetch("/api/result")));
       return;
@@ -503,6 +601,7 @@ async function poll() {
     else if (scan.state === "error") statusEl.textContent = scan.error || "No se pudo analizar la carpeta.";
   } catch (error) {
     setBusy(false);
+    setLoading(false);
     statusEl.textContent = error.message;
   }
 }
@@ -1183,17 +1282,36 @@ pathInput.addEventListener("keydown", (ev) => {
 });
 demoBtn.addEventListener("click", async () => {
   setBusy(true);
+  scanUi.lastPartialSeq = 0;
+  let keepBusy = false;
   try {
-    applyResult(await readJson(await fetch("/api/demo", { method: "POST" })));
+    const payload = await readJson(await fetch("/api/demo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slow: slowScan }),
+    }));
+    if (slowScan || payload.slow || payload.state === "running") {
+      keepBusy = true;
+      setLoading(true);
+      statusEl.textContent = "Cargando…";
+      poll();
+      return;
+    }
+    applyResult(payload);
   } catch (error) {
+    setLoading(false);
     statusEl.textContent = error.message;
   } finally {
-    setBusy(false);
+    if (!keepBusy) setBusy(false);
   }
 });
 cancelBtn.addEventListener("click", () => {
   fetch("/api/cancel", { method: "POST" });
+  setLoading(false);
   statusEl.textContent = "Cancelando…";
+});
+debugBtn.addEventListener("click", () => {
+  downloadDebug();
 });
 browseUp.addEventListener("click", () => {
   if (browseUp.dataset.path) loadBrowse(browseUp.dataset.path).catch((error) => {

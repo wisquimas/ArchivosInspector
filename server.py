@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import heapq
 import json
 import os
+import platform
 import shutil
 import stat
 import subprocess
@@ -34,10 +36,87 @@ def resource_root() -> str:
 ROOT = resource_root()
 STATIC = os.path.join(ROOT, "static")
 
+APP_VERSION = "1.3.0"
 MAX_FILES = 7000
 MAX_DIRS = 4000
+PARTIAL_INTERVAL = 3.0
+PARTIAL_NODE_CAP = 420
+FAST_SIZE_PROGRESS_EVERY = 120
+SLOW_OP_MS = 500.0
+SLOW_OP_RING = 100
+SLOW_OP_WORST = 50
 REPARSE = 0x400
 SKIP_READ = 0x1000 | 0x40000 | 0x400000  # offline, recall on open, recall on data access
+ACCESS_DENIED_MSG = (
+    "No hay acceso a esta carpeta (suele ser un enlace del sistema protegido). "
+    "Prueba C:\\Users\\…"
+)
+
+
+class SlowOpLog:
+    """Ring de operaciones I/O lentas + heap de las peores (sin pesar el caso rápido)."""
+
+    def __init__(self, threshold_ms: float = SLOW_OP_MS, ring: int = SLOW_OP_RING, worst: int = SLOW_OP_WORST):
+        self.threshold_ms = threshold_ms
+        self.recent: deque[dict] = deque(maxlen=ring)
+        self._worst: list[tuple] = []
+        self._worst_cap = worst
+        self._seq = 0
+
+    def add(self, op: str, path: str, ms: float) -> None:
+        if ms < self.threshold_ms:
+            return
+        self._seq += 1
+        event = {
+            "op": op,
+            "path": path,
+            "ms": round(ms, 1),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        self.recent.append(event)
+        item = (ms, self._seq, event)
+        if len(self._worst) < self._worst_cap:
+            heapq.heappush(self._worst, item)
+        elif ms > self._worst[0][0]:
+            heapq.heapreplace(self._worst, item)
+
+    def recent_list(self) -> list[dict]:
+        return list(self.recent)
+
+    def top(self, n: int = 10) -> list[dict]:
+        ranked = sorted(self._worst, key=lambda item: item[0], reverse=True)
+        return [event for _ms, _seq, event in ranked[:n]]
+
+    def count(self) -> int:
+        return len(self.recent)
+
+
+def is_access_denied(exc: BaseException) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if getattr(exc, "winerror", None) == 5:
+        return True
+    return getattr(exc, "errno", None) in (errno.EACCES, errno.EPERM)
+
+
+def log_access_denied(path: str, exc: BaseException) -> None:
+    print(f"[acceso denegado] {path}: {exc}", file=sys.stderr)
+
+
+def access_denied_user_message(path: str, exc: BaseException) -> str:
+    log_access_denied(path, exc)
+    return ACCESS_DENIED_MSG
+
+
+def user_facing_os_error(path: str, exc: BaseException) -> str:
+    if is_access_denied(exc):
+        return access_denied_user_message(path, exc)
+    return f"No se puede leer la carpeta: {exc}"
+
+
+def is_reparse_dir(st: os.stat_result) -> bool:
+    return bool(stat.S_ISDIR(st.st_mode) and (getattr(st, "st_file_attributes", 0) & REPARSE))
+
 
 CATEGORIES = {
     "video": ["mp4", "mkv", "avi", "mov", "webm", "wmv", "m4v", "flv", "mpeg", "mpg"],
@@ -53,6 +132,7 @@ EXT_TO_CAT = {ext: cat for cat, exts in CATEGORIES.items() for ext in exts}
 LOCK = threading.Lock()
 SCAN = {
     "state": "idle",
+    "phase": "idle",
     "files": 0,
     "dirs": 0,
     "bytes": 0,
@@ -61,6 +141,9 @@ SCAN = {
     "error": "",
     "result": None,
     "scanner": None,
+    "partial": None,
+    "partial_seq": 0,
+    "partial_at": 0.0,
 }
 
 
@@ -121,6 +204,13 @@ class Scanner:
         self.hit_dir_cap = False
         self.current = self.root
         self._ids = 0
+        self.phase = "scanning"
+        self._last_partial = 0.0
+        self._partial_budget = {"left": PARTIAL_NODE_CAP}
+        self.slow = SlowOpLog()
+        self.phase_times: list[dict] = []
+        self.scan_started = time.time()
+        self.phase_started = self.scan_started
 
     def nid(self) -> int:
         self._ids += 1
@@ -139,6 +229,33 @@ class Scanner:
             "leaves": [],
         }
 
+    def set_phase(self, phase: str) -> None:
+        now = time.time()
+        if self.phase and self.phase != phase:
+            self.phase_times.append(
+                {
+                    "phase": self.phase,
+                    "ms": round((now - self.phase_started) * 1000, 1),
+                }
+            )
+        self.phase = phase
+        self.phase_started = now
+        self.publish()
+
+    def timed_scandir(self, path: str) -> list:
+        t0 = time.perf_counter()
+        try:
+            return list(os.scandir(path))
+        finally:
+            self.slow.add("scandir", path, (time.perf_counter() - t0) * 1000)
+
+    def timed_stat(self, entry) -> os.stat_result:
+        t0 = time.perf_counter()
+        try:
+            return entry.stat(follow_symlinks=False)
+        finally:
+            self.slow.add("stat", entry.path, (time.perf_counter() - t0) * 1000)
+
     def publish(self) -> None:
         with LOCK:
             if SCAN.get("scanner") is not self:
@@ -147,6 +264,111 @@ class Scanner:
             SCAN["dirs"] = self.dir_count
             SCAN["bytes"] = self.bytes
             SCAN["current"] = self.current
+            SCAN["phase"] = self.phase
+
+    def store_partial(self, tree: dict, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._last_partial < PARTIAL_INTERVAL:
+            return
+        self._last_partial = now
+        payload = {
+            "demo": False,
+            "partial": True,
+            "root": tree,
+            "root_path": self.root,
+            "capped": True,
+            "files_seen": self.files_seen,
+            "files_kept": 0,
+            "dirs": self.dir_count,
+            "bytes": tree.get("size") or self.bytes,
+            "skipped": self.skipped,
+            "elapsed": 0,
+            "duplicates": 0,
+            "disk": None,
+            "note": "Vista parcial mientras se analiza…",
+            "phase": self.phase,
+        }
+        with LOCK:
+            if SCAN.get("scanner") is not self:
+                return
+            SCAN["partial"] = payload
+            SCAN["partial_seq"] = int(SCAN.get("partial_seq") or 0) + 1
+            SCAN["partial_at"] = now
+            SCAN["phase"] = self.phase
+            SCAN["files"] = self.files_seen
+            SCAN["dirs"] = self.dir_count
+            SCAN["bytes"] = self.bytes
+            SCAN["current"] = self.current
+
+    def maybe_partial(self, force: bool = False) -> None:
+        if self.cancel or self.root not in self.dirs:
+            return
+        now = time.time()
+        if not force and now - self._last_partial < PARTIAL_INTERVAL:
+            return
+        try:
+            self.compute(self.root)
+            self._partial_budget = {"left": PARTIAL_NODE_CAP}
+            tree = self.build_partial(self.root)
+            self.store_partial(tree, force=True)
+        except Exception:
+            traceback.print_exc()
+
+    def build_partial(self, path: str) -> dict:
+        budget = self._partial_budget
+        rec = self.dirs[path]
+        children: list[dict] = []
+        if budget["left"] > 0:
+            for child_path in rec["child_dirs"]:
+                if budget["left"] <= 0:
+                    break
+                budget["left"] -= 1
+                children.append(self.build_partial(child_path))
+            for leaf in rec["leaves"]:
+                if budget["left"] <= 0:
+                    break
+                budget["left"] -= 1
+                children.append(dict(leaf))
+            if rec["file_bytes"] > 0 or rec["file_count"] > 0:
+                if budget["left"] > 0:
+                    budget["left"] -= 1
+                    children.append(
+                        {
+                            "id": self.nid(),
+                            "name": f"Archivos ({rec['file_count']})",
+                            "path": None,
+                            "dir": False,
+                            "size": max(0, rec["file_bytes"]),
+                            "mtime": rec["newest"] or rec["mtime"] or None,
+                            "ext": "",
+                            "category": "other",
+                            "children": [],
+                            "count": rec["file_count"],
+                            "dup": None,
+                            "dup_kind": None,
+                            "dup_count": 0,
+                            "aggregate": True,
+                            "collapsed": False,
+                        }
+                    )
+        return {
+            "id": self.nid(),
+            "name": rec["name"],
+            "path": rec["path"],
+            "dir": True,
+            "size": rec.get("size") or rec["file_bytes"],
+            "mtime": rec.get("newest") or rec["mtime"] or None,
+            "oldest": rec.get("oldest") or None,
+            "ext": "",
+            "category": "folder",
+            "children": children,
+            "count": rec.get("count") or rec["file_count"],
+            "dup": None,
+            "dup_kind": None,
+            "dup_count": 0,
+            "aggregate": False,
+            "collapsed": False,
+        }
 
     def add_file(self, path: str, size: int, mtime: float, ext: str) -> None:
         self.files_seen += 1
@@ -167,48 +389,74 @@ class Scanner:
             heapq.heapreplace(self.files_heap, item)
         if self.files_seen % 200 == 0:
             self.publish()
+            self.maybe_partial()
 
     def fast_size(self, path: str) -> tuple[int, int, float, float]:
+        prev_phase = self.phase
+        self.set_phase("measuring")
+        t0 = time.perf_counter()
         total = 0
         count = 0
         newest = 0.0
         oldest = 0.0
         stack = [path]
-        while stack:
-            if self.cancel:
-                break
-            current = stack.pop()
-            self.current = current
-            try:
-                entries = list(os.scandir(current))
-            except OSError:
-                self.skipped += 1
-                continue
-            for entry in entries:
+        local_seen = 0
+        try:
+            while stack:
                 if self.cancel:
                     break
+                current = stack.pop()
+                self.current = current
                 try:
-                    st = entry.stat(follow_symlinks=False)
-                except OSError:
+                    entries = self.timed_scandir(current)
+                except OSError as exc:
+                    if is_access_denied(exc):
+                        log_access_denied(current, exc)
                     self.skipped += 1
                     continue
-                if stat.S_ISDIR(st.st_mode):
-                    if getattr(st, "st_file_attributes", 0) & REPARSE:
+                for entry in entries:
+                    if self.cancel:
+                        break
+                    try:
+                        st = self.timed_stat(entry)
+                    except OSError as exc:
+                        if is_access_denied(exc):
+                            log_access_denied(entry.path, exc)
                         self.skipped += 1
                         continue
-                    stack.append(entry.path)
-                    continue
-                if not stat.S_ISREG(st.st_mode):
-                    continue
-                total += st.st_size
-                count += 1
-                if st.st_mtime > newest:
-                    newest = st.st_mtime
-                if st.st_mtime > 0 and (oldest <= 0 or st.st_mtime < oldest):
-                    oldest = st.st_mtime
+                    if is_reparse_dir(st):
+                        self.skipped += 1
+                        continue
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(entry.path)
+                        continue
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
+                    total += st.st_size
+                    count += 1
+                    local_seen += 1
+                    if st.st_mtime > newest:
+                        newest = st.st_mtime
+                    if st.st_mtime > 0 and (oldest <= 0 or st.st_mtime < oldest):
+                        oldest = st.st_mtime
+                    if local_seen % FAST_SIZE_PROGRESS_EVERY == 0:
+                        # progreso provisional dentro de la carpeta medida (sin doble-contar al final)
+                        base_files = self.files_seen
+                        base_bytes = self.bytes
+                        self.files_seen = base_files + local_seen
+                        self.bytes = base_bytes + total
+                        self.publish()
+                        self.maybe_partial()
+                        self.files_seen = base_files
+                        self.bytes = base_bytes
+        finally:
+            self.slow.add("fast_size", path, (time.perf_counter() - t0) * 1000)
         self.files_seen += count
         self.bytes += total
         self.publish()
+        self.maybe_partial()
+        if not self.cancel:
+            self.set_phase(prev_phase if prev_phase else "scanning")
         return total, count, newest, oldest
 
     def execute(self) -> dict:
@@ -216,6 +464,7 @@ class Scanner:
         if not os.path.isdir(self.root):
             raise ValueError("La ruta no es una carpeta")
 
+        self.set_phase("scanning")
         root_rec = self.blank_dir(self.root)
         try:
             st = os.stat(self.root)
@@ -226,6 +475,7 @@ class Scanner:
         self.dirs[self.root] = root_rec
         self.dir_count = 1
         queue = deque([self.root])
+        self.maybe_partial(force=True)
 
         while queue:
             if self.cancel:
@@ -234,24 +484,30 @@ class Scanner:
             rec = self.dirs[current]
             self.current = current
             self.publish()
+            self.maybe_partial()
             try:
-                entries = list(os.scandir(current))
-            except OSError:
+                entries = self.timed_scandir(current)
+            except OSError as exc:
                 self.skipped += 1
+                if os.path.normcase(current) == os.path.normcase(self.root):
+                    raise ValueError(user_facing_os_error(current, exc)) from exc
+                if is_access_denied(exc):
+                    log_access_denied(current, exc)
                 continue
             for entry in entries:
                 if self.cancel:
                     break
                 try:
-                    st = entry.stat(follow_symlinks=False)
-                except OSError:
+                    st = self.timed_stat(entry)
+                except OSError as exc:
+                    if is_access_denied(exc):
+                        log_access_denied(entry.path, exc)
                     self.skipped += 1
                     continue
-                attrs = getattr(st, "st_file_attributes", 0)
+                if is_reparse_dir(st):
+                    self.skipped += 1
+                    continue
                 if stat.S_ISDIR(st.st_mode):
-                    if attrs & REPARSE:
-                        self.skipped += 1
-                        continue
                     path = norm(entry.path)
                     if self.dir_count >= self.max_dirs:
                         self.hit_dir_cap = True
@@ -278,6 +534,7 @@ class Scanner:
                                 "collapsed": True,
                             }
                         )
+                        self.maybe_partial()
                         continue
                     child = self.blank_dir(path)
                     child["mtime"] = st.st_mtime
@@ -305,7 +562,17 @@ class Scanner:
             }
             for size, _seq, path, mtime, ext in self.files_heap
         ]
-        dup_groups = mark_duplicates(kept)
+        self.set_phase("hashing")
+        self.maybe_partial(force=True)
+        hash_counter = {"n": 0}
+
+        def on_hash_progress() -> None:
+            hash_counter["n"] += 1
+            if hash_counter["n"] % 8 == 0:
+                self.current = "Buscando duplicados…"
+                self.publish()
+
+        dup_groups = mark_duplicates(kept, on_progress=on_hash_progress, slow_log=self.slow)
         kept_by_dir: dict[str, list] = defaultdict(list)
         for item in kept:
             kept_by_dir[os.path.dirname(item["path"])].append(item)
@@ -332,6 +599,7 @@ class Scanner:
             note += ". El resto conserva su tamaño dentro de bloques «Otros» o carpetas cerradas."
             note = note.replace(",", ".")
 
+        self.set_phase("done")
         return {
             "demo": False,
             "cancelled": False,
@@ -476,7 +744,7 @@ def fingerprint(path: str, size: int) -> str | None:
     return digest.hexdigest()
 
 
-def mark_duplicates(files: list[dict]) -> int:
+def mark_duplicates(files: list[dict], on_progress=None, slow_log: SlowOpLog | None = None) -> int:
     groups: dict[int, list[dict]] = defaultdict(list)
     for item in files:
         if item["size"] > 0:
@@ -493,9 +761,14 @@ def mark_duplicates(files: list[dict]) -> int:
         else:
             kind = "hash"
             for item in group:
+                t0 = time.perf_counter()
                 token = fingerprint(item["path"], item["size"])
+                if slow_log is not None:
+                    slow_log.add("fingerprint", item["path"], (time.perf_counter() - t0) * 1000)
                 if token:
                     buckets[token].append(item)
+                if on_progress:
+                    on_progress()
         for token, bucket in buckets.items():
             if len(bucket) < 2:
                 continue
@@ -505,6 +778,8 @@ def mark_duplicates(files: list[dict]) -> int:
                 item["dup"] = label
                 item["dup_kind"] = "contenido" if kind == "hash" else "tamaño"
                 item["dup_count"] = len(bucket)
+        if on_progress:
+            on_progress()
     return found
 
 
@@ -687,18 +962,110 @@ def clean_dir(path: str) -> str:
     return full
 
 
-def status_payload() -> dict:
+def status_payload(include_partial: bool = True) -> dict:
     with LOCK:
         started = SCAN["started"]
-        return {
+        payload = {
             "state": SCAN["state"],
+            "phase": SCAN.get("phase") or "idle",
             "files": SCAN["files"],
             "dirs": SCAN["dirs"],
             "bytes": SCAN["bytes"],
             "current": SCAN["current"],
             "elapsed": round(time.time() - started, 1) if started else 0,
             "error": SCAN["error"],
+            "partial_seq": int(SCAN.get("partial_seq") or 0),
+            "partial_at": SCAN.get("partial_at") or 0,
+            "app_version": APP_VERSION,
         }
+        if include_partial and SCAN.get("partial") is not None:
+            payload["partial"] = SCAN["partial"]
+        return payload
+
+
+def build_debug_report() -> dict:
+    """Informe liviano para que el cliente envíe feedback cuando el análisis se traba."""
+    now = time.time()
+    with LOCK:
+        state = SCAN["state"]
+        phase = SCAN.get("phase") or "idle"
+        files = SCAN["files"]
+        dirs = SCAN["dirs"]
+        bytes_ = SCAN["bytes"]
+        current = SCAN["current"]
+        started = SCAN["started"]
+        error = SCAN["error"] or ""
+        scanner = SCAN.get("scanner")
+
+    cancelled = bool(getattr(scanner, "cancel", False)) if scanner is not None else False
+    if state == "cancelled":
+        cancelled = True
+
+    slow = getattr(scanner, "slow", None) if scanner is not None else None
+    if not isinstance(slow, SlowOpLog):
+        slow = SlowOpLog()
+    phase_times = list(getattr(scanner, "phase_times", []) or []) if scanner is not None else []
+    phase_started = float(getattr(scanner, "phase_started", started) or started or now)
+    scan_started = float(getattr(scanner, "scan_started", started) or started or now)
+    root = getattr(scanner, "root", None) if scanner is not None else None
+    skipped = int(getattr(scanner, "skipped", 0) or 0) if scanner is not None else 0
+    files_seen = int(getattr(scanner, "files_seen", files) or files) if scanner is not None else files
+
+    elapsed_total_s = round(max(0.0, now - scan_started), 2) if scan_started else 0.0
+    phase_elapsed_s = round(max(0.0, now - phase_started), 2) if phase_started else 0.0
+    top_slow = slow.top(10)
+    recent = slow.recent_list()
+
+    return {
+        "app_version": APP_VERSION,
+        "os": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+        },
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "state": state,
+        "phase": phase,
+        "root": root,
+        "files_seen": files_seen,
+        "dirs": dirs,
+        "bytes": bytes_,
+        "skipped": skipped,
+        "current": current,
+        "cancelled": cancelled,
+        "error": error or None,
+        "elapsed_total_s": elapsed_total_s,
+        "phase_elapsed_s": phase_elapsed_s,
+        "phases": phase_times,
+        "slow_ops_threshold_ms": SLOW_OP_MS,
+        "slow_ops_recent": recent,
+        "top_slow": top_slow,
+        "summary": {
+            "slow_ops_recorded": slow.count(),
+            "top_10": top_slow,
+            "elapsed_total_s": elapsed_total_s,
+            "phase_elapsed_s": phase_elapsed_s,
+            "current_phase": phase,
+        },
+    }
+
+
+def reset_scan_fields(scanner=None, folder: str = "", phase: str = "scanning") -> None:
+    SCAN["scanner"] = scanner
+    SCAN["state"] = "running"
+    SCAN["phase"] = phase
+    SCAN["files"] = 0
+    SCAN["dirs"] = 0
+    SCAN["bytes"] = 0
+    SCAN["current"] = folder
+    SCAN["started"] = time.time()
+    SCAN["error"] = ""
+    SCAN["result"] = None
+    SCAN["partial"] = None
+    SCAN["partial_seq"] = 0
+    SCAN["partial_at"] = 0.0
 
 
 def start_scan(path: str) -> None:
@@ -708,38 +1075,232 @@ def start_scan(path: str) -> None:
         previous = SCAN.get("scanner")
         if previous is not None:
             previous.cancel = True
-        SCAN["scanner"] = scanner
-        SCAN["state"] = "running"
-        SCAN["files"] = 0
-        SCAN["dirs"] = 0
-        SCAN["bytes"] = 0
-        SCAN["current"] = folder
-        SCAN["started"] = time.time()
-        SCAN["error"] = ""
-        SCAN["result"] = None
+        reset_scan_fields(scanner, folder, "scanning")
 
     def run() -> None:
         try:
             result = scanner.execute()
         except Exception as exc:
             traceback.print_exc()
+            if isinstance(exc, ValueError):
+                msg = str(exc)
+            elif is_access_denied(exc):
+                msg = access_denied_user_message(folder, exc)
+            else:
+                msg = str(exc)
             with LOCK:
                 if SCAN.get("scanner") is scanner:
                     SCAN["state"] = "error"
-                    SCAN["error"] = str(exc)
+                    SCAN["phase"] = "error"
+                    SCAN["error"] = msg
             return
         with LOCK:
             if SCAN.get("scanner") is not scanner:
                 return
             if scanner.cancel or result.get("cancelled"):
                 SCAN["state"] = "cancelled"
+                SCAN["phase"] = "idle"
                 return
             SCAN["result"] = result
             SCAN["state"] = "done"
+            SCAN["phase"] = "done"
             SCAN["bytes"] = result["bytes"]
             SCAN["files"] = result["files_seen"]
+            SCAN["partial"] = None
 
     threading.Thread(target=run, daemon=True).start()
+
+
+class DemoSlowScanner:
+    """Simula un análisis largo del ejemplo para probar la ciudad Matrix."""
+
+    def __init__(self):
+        self.cancel = False
+        self.root = "Ejemplo — disco"
+        self.files_seen = 0
+        self.skipped = 0
+        self.slow = SlowOpLog()
+        self.phase_times: list[dict] = []
+        self.scan_started = time.time()
+        self.phase_started = self.scan_started
+        self.phase = "scanning"
+
+    def _set_phase(self, phase: str) -> None:
+        now = time.time()
+        if self.phase and self.phase != phase:
+            self.phase_times.append(
+                {
+                    "phase": self.phase,
+                    "ms": round((now - self.phase_started) * 1000, 1),
+                }
+            )
+        self.phase = phase
+        self.phase_started = now
+
+    def run(self) -> dict | None:
+        full = demo_result()
+        children = list(full["root"]["children"] or [])
+        with LOCK:
+            if SCAN.get("scanner") is not self:
+                return None
+            SCAN["phase"] = "scanning"
+            SCAN["current"] = self.root
+            SCAN["dirs"] = 1
+            SCAN["files"] = 0
+            SCAN["bytes"] = 0
+        self._set_phase("scanning")
+
+        def folder_slice(n: int) -> dict:
+            slice_kids = children[: max(1, n)]
+            root = dict(full["root"])
+            root["children"] = slice_kids
+            root["size"] = sum(child["size"] for child in slice_kids)
+            root["count"] = sum(child["count"] for child in slice_kids)
+            return root
+
+        steps = max(1, len(children))
+        for index in range(1, steps + 1):
+            if self.cancel:
+                return {"cancelled": True}
+            tree = folder_slice(index)
+            files = tree["count"]
+            bytes_ = tree["size"]
+            payload = {
+                "demo": True,
+                "partial": True,
+                "root": tree,
+                "root_path": None,
+                "capped": False,
+                "files_seen": files,
+                "files_kept": files,
+                "dirs": 2 + index,
+                "bytes": bytes_,
+                "skipped": 0,
+                "elapsed": 0,
+                "duplicates": 0,
+                "disk": None,
+                "note": "Ejemplo lento (slowScan): construyendo ciudad…",
+                "phase": "scanning",
+            }
+            with LOCK:
+                if SCAN.get("scanner") is not self:
+                    return None
+                SCAN["phase"] = "scanning"
+                SCAN["files"] = files
+                SCAN["dirs"] = 2 + index
+                SCAN["bytes"] = bytes_
+                SCAN["current"] = f"Ejemplo / {children[index - 1]['name']}"
+                SCAN["partial"] = payload
+                SCAN["partial_seq"] = int(SCAN.get("partial_seq") or 0) + 1
+                SCAN["partial_at"] = time.time()
+            self.files_seen = files
+            t0 = time.perf_counter()
+            time.sleep(2.8)
+            self.slow.add("scandir", f"Ejemplo / {children[index - 1]['name']}", (time.perf_counter() - t0) * 1000)
+            if self.cancel:
+                return {"cancelled": True}
+
+        with LOCK:
+            if SCAN.get("scanner") is not self:
+                return None
+            SCAN["phase"] = "measuring"
+            SCAN["current"] = "Ejemplo / midiendo carpeta grande…"
+        self._set_phase("measuring")
+        t0 = time.perf_counter()
+        time.sleep(4.5)
+        self.slow.add("fast_size", "Ejemplo / midiendo carpeta grande…", (time.perf_counter() - t0) * 1000)
+        if self.cancel:
+            return {"cancelled": True}
+
+        with LOCK:
+            if SCAN.get("scanner") is not self:
+                return None
+            SCAN["phase"] = "hashing"
+            SCAN["current"] = "Buscando duplicados…"
+            tree = folder_slice(steps)
+            SCAN["partial"] = {
+                "demo": True,
+                "partial": True,
+                "root": tree,
+                "root_path": None,
+                "capped": False,
+                "files_seen": tree["count"],
+                "files_kept": tree["count"],
+                "dirs": 8,
+                "bytes": tree["size"],
+                "skipped": 0,
+                "elapsed": 0,
+                "duplicates": 0,
+                "disk": None,
+                "note": "Ejemplo lento: finalizando…",
+                "phase": "hashing",
+            }
+            SCAN["partial_seq"] = int(SCAN.get("partial_seq") or 0) + 1
+            SCAN["partial_at"] = time.time()
+        self._set_phase("hashing")
+        self.files_seen = tree["count"]
+        t0 = time.perf_counter()
+        time.sleep(3.2)
+        self.slow.add("fingerprint", "Ejemplo / duplicados", (time.perf_counter() - t0) * 1000)
+        if self.cancel:
+            return {"cancelled": True}
+        return full
+
+
+def start_demo(slow: bool = False) -> dict | None:
+    with LOCK:
+        previous = SCAN.get("scanner")
+        if previous is not None:
+            previous.cancel = True
+
+    if not slow:
+        result = demo_result()
+        with LOCK:
+            SCAN["scanner"] = None
+            SCAN["state"] = "done"
+            SCAN["phase"] = "done"
+            SCAN["result"] = result
+            SCAN["error"] = ""
+            SCAN["bytes"] = result["bytes"]
+            SCAN["files"] = result["files_seen"]
+            SCAN["dirs"] = result.get("dirs") or 0
+            SCAN["current"] = ""
+            SCAN["partial"] = None
+            SCAN["partial_seq"] = int(SCAN.get("partial_seq") or 0)
+            SCAN["partial_at"] = 0.0
+        return result
+
+    demo = DemoSlowScanner()
+    with LOCK:
+        reset_scan_fields(demo, "Ejemplo — disco", "scanning")
+
+    def run() -> None:
+        try:
+            result = demo.run()
+        except Exception as exc:
+            traceback.print_exc()
+            with LOCK:
+                if SCAN.get("scanner") is demo:
+                    SCAN["state"] = "error"
+                    SCAN["phase"] = "error"
+                    SCAN["error"] = str(exc)
+            return
+        with LOCK:
+            if SCAN.get("scanner") is not demo:
+                return
+            if demo.cancel or not result or result.get("cancelled"):
+                SCAN["state"] = "cancelled"
+                SCAN["phase"] = "idle"
+                return
+            SCAN["result"] = result
+            SCAN["state"] = "done"
+            SCAN["phase"] = "done"
+            SCAN["bytes"] = result["bytes"]
+            SCAN["files"] = result["files_seen"]
+            SCAN["partial"] = None
+
+    threading.Thread(target=run, daemon=True).start()
+    return None
 
 
 def browse(path: str | None) -> dict:
@@ -751,13 +1312,20 @@ def browse(path: str | None) -> dict:
     try:
         entries = list(os.scandir(folder))
     except OSError as exc:
-        raise ValueError(f"No se puede leer la carpeta: {exc}") from exc
+        raise ValueError(user_facing_os_error(folder, exc)) from exc
     for entry in entries:
         try:
-            if entry.is_dir(follow_symlinks=False):
-                dirs.append({"name": entry.name, "path": norm(entry.path)})
-        except OSError:
+            st = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            if is_access_denied(exc):
+                log_access_denied(entry.path, exc)
             continue
+        # Saltar junctions/reparse (Documents and Settings, Archivos de programa, …)
+        if is_reparse_dir(st):
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            continue
+        dirs.append({"name": entry.name, "path": norm(entry.path)})
     dirs.sort(key=lambda item: item["name"].lower())
     truncated = len(dirs) > 500
     return {
@@ -841,7 +1409,33 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(browse(raw))
                 return
             if parsed.path == "/api/scan":
-                self.send_json(status_payload())
+                self.send_json(status_payload(include_partial=True))
+                return
+            if parsed.path == "/api/scan/debug":
+                report = build_debug_report()
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                data = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="ArchivosInspector-debug-{stamp}.json"',
+                )
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if parsed.path == "/api/scan/partial":
+                with LOCK:
+                    partial = SCAN.get("partial")
+                    seq = int(SCAN.get("partial_seq") or 0)
+                    phase = SCAN.get("phase") or "idle"
+                    state = SCAN["state"]
+                if partial is None:
+                    self.send_json({"error": "Sin árbol parcial", "partial_seq": seq, "phase": phase, "state": state}, 404)
+                    return
+                self.send_json({"partial_seq": seq, "phase": phase, "state": state, "result": partial})
                 return
             if parsed.path == "/api/result":
                 with LOCK:
@@ -882,19 +1476,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
                 return
             if parsed.path == "/api/demo":
-                result = demo_result()
-                with LOCK:
-                    previous = SCAN.get("scanner")
-                    if previous is not None:
-                        previous.cancel = True
-                    SCAN["scanner"] = None
-                    SCAN["state"] = "done"
-                    SCAN["result"] = result
-                    SCAN["error"] = ""
-                    SCAN["bytes"] = result["bytes"]
-                    SCAN["files"] = result["files_seen"]
-                    SCAN["current"] = ""
-                self.send_json(result)
+                slow = bool(body.get("slow") or body.get("slowScan"))
+                result = start_demo(slow=slow)
+                if result is None:
+                    self.send_json({"ok": True, "slow": True, "state": "running"})
+                else:
+                    self.send_json(result)
                 return
             if parsed.path in ("/api/open", "/api/reveal"):
                 path = existing_path(str(body.get("path") or ""))
