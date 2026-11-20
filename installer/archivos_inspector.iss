@@ -2,7 +2,7 @@
 ; Requiere Inno Setup 6+ y el build de PyInstaller en dist\ArchivosInspector\
 
 #define MyAppName "Archivos Inspector"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "Wisquimas"
 #define MyAppURL "https://github.com/wisquimas/ArchivosInspector"
 #define MyAppExeName "ArchivosInspector.exe"

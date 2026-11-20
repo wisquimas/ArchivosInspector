@@ -995,6 +995,45 @@ function pickEvent(ev) {
   return pickAt(x, y);
 }
 
+function pickWalk(ev) {
+  if (document.pointerLockElement === canvas) return pickAt(0, 0);
+  return pickEvent(ev);
+}
+
+const WALK_DBL_MS = 400;
+let walkClick = { time: 0, id: null };
+let suppressWalkDbl = false;
+
+function handleWalkPointer(ev) {
+  const node = pickWalk(ev);
+  if (!node || node === state.current) return;
+  const now = performance.now();
+  const dbl = walkClick.id === node.id && now - walkClick.time < WALK_DBL_MS;
+  walkClick = { time: now, id: node.id };
+  if (dbl) {
+    suppressWalkDbl = true;
+    if (node.dir) enter(node);
+    else if (node.path) openNode(node, false);
+    else selectInPlace(node);
+    return;
+  }
+  selectInPlace(node);
+}
+
+function updateWalkHover() {
+  if (state.view !== "walk" || document.pointerLockElement !== canvas) return;
+  const node = pickAt(0, 0);
+  if (!node || node === state.current) {
+    tooltip.hidden = true;
+    return;
+  }
+  const rect = canvas.getBoundingClientRect();
+  showHover(node, {
+    clientX: rect.left + rect.width / 2,
+    clientY: rect.top + rect.height * 0.42,
+  });
+}
+
 function setView(mode) {
   state.view = mode;
   setPressed(document.querySelector("#views"), "view", mode);
@@ -1023,7 +1062,8 @@ function setView(mode) {
     player.yaw = 0;
     player.pitch = -0.12;
     player.fly = 0;
-    hint.textContent = "WASD camina. Mouse mira. Espacio sube. Ctrl baja. Esc suelta el mouse.";
+    hint.textContent = "WASD camina. Mouse mira. Clic selecciona (mira). Doble clic entra. Espacio sube. Ctrl baja. Esc suelta el mouse.";
+    walkClick = { time: 0, id: null };
     canvas.requestPointerLock();
   }
 }
@@ -1078,6 +1118,7 @@ function updateWalk(dt) {
     eye + Math.sin(player.pitch),
     player.z - Math.cos(player.yaw) * cp
   );
+  updateWalkHover();
 }
 
 let last = performance.now();
@@ -1274,21 +1315,46 @@ stage.addEventListener("wheel", (ev) => {
   }));
 }, { passive: false, capture: true });
 canvas.addEventListener("pointerup", (ev) => {
-  if (!down || state.view === "walk") return;
-  if (Math.hypot(ev.clientX - down.x, ev.clientY - down.y) > 5) return;
+  if (!down) return;
+  const dragged = Math.hypot(ev.clientX - down.x, ev.clientY - down.y) > 5;
+  down = null;
+  if (dragged && state.view !== "walk") return;
+  if (state.view === "walk") {
+    // Con pointer lock el cursor no se mueve: el arrastre no aplica.
+    // Sin lock, un arrastre breve al mirar no debe seleccionar.
+    if (dragged && document.pointerLockElement !== canvas) return;
+    handleWalkPointer(ev);
+    return;
+  }
   const node = pickEvent(ev);
   if (!node || node === state.current) return;
   selectInPlace(node);
 });
 canvas.addEventListener("dblclick", (ev) => {
-  if (state.view === "walk") return;
+  if (state.view === "walk") {
+    if (suppressWalkDbl) {
+      suppressWalkDbl = false;
+      return;
+    }
+    // Respaldo si el navegador emite dblclick (p. ej. sin pointer lock).
+    const node = pickWalk(ev);
+    if (node?.dir) enter(node);
+    else if (node?.path) openNode(node, false);
+    return;
+  }
   const node = pickEvent(ev);
   if (node?.dir) enter(node);
   else if (node?.path) openNode(node, false);
 });
 canvas.addEventListener("pointermove", (ev) => {
   if (state.view === "walk") {
-    tooltip.hidden = true;
+    if (document.pointerLockElement === canvas) return;
+    const node = pickEvent(ev);
+    if (!node || node === state.current) {
+      tooltip.hidden = true;
+      return;
+    }
+    showHover(node, ev);
     return;
   }
   const node = pickEvent(ev);
@@ -1299,6 +1365,7 @@ canvas.addEventListener("pointermove", (ev) => {
   showHover(node, ev);
 });
 canvas.addEventListener("pointerleave", () => {
+  if (state.view === "walk" && document.pointerLockElement === canvas) return;
   tooltip.hidden = true;
 });
 canvas.addEventListener("click", () => {
@@ -1309,7 +1376,10 @@ document.addEventListener("pointerlockchange", () => {
   const locked = document.pointerLockElement === canvas;
   crosshair.hidden = !(locked && state.view === "walk");
   if (state.view === "walk" && !locked) {
-    hint.textContent = "Clic en la ciudad para mirar con el mouse. Órbita vuelve a la cámara libre.";
+    tooltip.hidden = true;
+    hint.textContent = "Clic en la ciudad para mirar. Clic selecciona. Doble clic entra. Órbita vuelve a la cámara libre.";
+  } else if (state.view === "walk" && locked) {
+    hint.textContent = "WASD camina. Mouse mira. Clic selecciona (mira). Doble clic entra. Espacio sube. Ctrl baja. Esc suelta el mouse.";
   }
 });
 window.addEventListener("keydown", (ev) => {
