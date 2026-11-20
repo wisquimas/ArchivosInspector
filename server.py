@@ -24,7 +24,14 @@ try:
 except Exception:
     pass
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+def resource_root() -> str:
+    """Carpeta de recursos: código fuente o bundle de PyInstaller."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS  # type: ignore[attr-defined]
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+ROOT = resource_root()
 STATIC = os.path.join(ROOT, "static")
 
 MAX_FILES = 7000
