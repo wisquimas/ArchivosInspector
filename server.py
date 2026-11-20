@@ -36,7 +36,7 @@ def resource_root() -> str:
 ROOT = resource_root()
 STATIC = os.path.join(ROOT, "static")
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 MAX_FILES = 7000
 MAX_DIRS = 4000
 PARTIAL_INTERVAL = 3.0
@@ -144,6 +144,9 @@ SCAN = {
     "partial": None,
     "partial_seq": 0,
     "partial_at": 0.0,
+    "hash_done": 0,
+    "hash_total": 0,
+    "detect_duplicates": False,
 }
 
 
@@ -188,11 +191,34 @@ def drives() -> list[str]:
     return letters
 
 
+def parse_flag(value, default: bool = False) -> bool:
+    """Interpreta duplicates=0|1 (o true/false) desde query/body."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "si", "sí"):
+        return True
+    if text in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+
 class Scanner:
-    def __init__(self, root: str, max_files: int = MAX_FILES, max_dirs: int = MAX_DIRS):
+    def __init__(
+        self,
+        root: str,
+        max_files: int = MAX_FILES,
+        max_dirs: int = MAX_DIRS,
+        detect_duplicates: bool = False,
+    ):
         self.root = norm(root)
         self.max_files = max_files
         self.max_dirs = max_dirs
+        self.detect_duplicates = detect_duplicates
         self.cancel = False
         self.files_heap: list[tuple] = []
         self.seq = 0
@@ -211,6 +237,8 @@ class Scanner:
         self.phase_times: list[dict] = []
         self.scan_started = time.time()
         self.phase_started = self.scan_started
+        self.hash_done = 0
+        self.hash_total = 0
 
     def nid(self) -> int:
         self._ids += 1
@@ -265,6 +293,9 @@ class Scanner:
             SCAN["bytes"] = self.bytes
             SCAN["current"] = self.current
             SCAN["phase"] = self.phase
+            SCAN["hash_done"] = self.hash_done
+            SCAN["hash_total"] = self.hash_total
+            SCAN["detect_duplicates"] = self.detect_duplicates
 
     def store_partial(self, tree: dict, force: bool = False) -> None:
         now = time.time()
@@ -562,17 +593,28 @@ class Scanner:
             }
             for size, _seq, path, mtime, ext in self.files_heap
         ]
-        self.set_phase("hashing")
-        self.maybe_partial(force=True)
-        hash_counter = {"n": 0}
+        dup_groups = 0
+        if self.detect_duplicates:
+            self.hash_done = 0
+            self.hash_total = 0
+            self.current = "Buscando duplicados…"
+            self.set_phase("hashing")
+            self.maybe_partial(force=True)
 
-        def on_hash_progress() -> None:
-            hash_counter["n"] += 1
-            if hash_counter["n"] % 8 == 0:
-                self.current = "Buscando duplicados…"
+            def on_hash_progress(done: int, total: int) -> None:
+                if self.cancel:
+                    return
+                self.hash_done = done
+                self.hash_total = total
+                if total > 0:
+                    self.current = f"Buscando duplicados… {done} / {total} grupos"
+                else:
+                    self.current = "Buscando duplicados…"
                 self.publish()
 
-        dup_groups = mark_duplicates(kept, on_progress=on_hash_progress, slow_log=self.slow)
+            dup_groups = mark_duplicates(kept, on_progress=on_hash_progress, slow_log=self.slow)
+            if self.cancel:
+                return {"cancelled": True}
         kept_by_dir: dict[str, list] = defaultdict(list)
         for item in kept:
             kept_by_dir[os.path.dirname(item["path"])].append(item)
@@ -749,10 +791,12 @@ def mark_duplicates(files: list[dict], on_progress=None, slow_log: SlowOpLog | N
     for item in files:
         if item["size"] > 0:
             groups[item["size"]].append(item)
+    candidates = [(size, group) for size, group in groups.items() if len(group) >= 2]
+    total = len(candidates)
+    if on_progress:
+        on_progress(0, total)
     found = 0
-    for size, group in groups.items():
-        if len(group) < 2:
-            continue
+    for index, (size, group) in enumerate(candidates, start=1):
         too_big = len(group) > 60 or size * len(group) > 8 * 1024**3
         buckets: dict[str, list[dict]] = defaultdict(list)
         if too_big:
@@ -767,8 +811,6 @@ def mark_duplicates(files: list[dict], on_progress=None, slow_log: SlowOpLog | N
                     slow_log.add("fingerprint", item["path"], (time.perf_counter() - t0) * 1000)
                 if token:
                     buckets[token].append(item)
-                if on_progress:
-                    on_progress()
         for token, bucket in buckets.items():
             if len(bucket) < 2:
                 continue
@@ -779,7 +821,7 @@ def mark_duplicates(files: list[dict], on_progress=None, slow_log: SlowOpLog | N
                 item["dup_kind"] = "contenido" if kind == "hash" else "tamaño"
                 item["dup_count"] = len(bucket)
         if on_progress:
-            on_progress()
+            on_progress(index, total)
     return found
 
 
@@ -976,6 +1018,9 @@ def status_payload(include_partial: bool = True) -> dict:
             "error": SCAN["error"],
             "partial_seq": int(SCAN.get("partial_seq") or 0),
             "partial_at": SCAN.get("partial_at") or 0,
+            "hash_done": int(SCAN.get("hash_done") or 0),
+            "hash_total": int(SCAN.get("hash_total") or 0),
+            "detect_duplicates": bool(SCAN.get("detect_duplicates")),
             "app_version": APP_VERSION,
         }
         if include_partial and SCAN.get("partial") is not None:
@@ -996,6 +1041,9 @@ def build_debug_report() -> dict:
         started = SCAN["started"]
         error = SCAN["error"] or ""
         scanner = SCAN.get("scanner")
+        hash_done_scan = int(SCAN.get("hash_done") or 0)
+        hash_total_scan = int(SCAN.get("hash_total") or 0)
+        detect_duplicates_scan = bool(SCAN.get("detect_duplicates"))
 
     cancelled = bool(getattr(scanner, "cancel", False)) if scanner is not None else False
     if state == "cancelled":
@@ -1010,6 +1058,9 @@ def build_debug_report() -> dict:
     root = getattr(scanner, "root", None) if scanner is not None else None
     skipped = int(getattr(scanner, "skipped", 0) or 0) if scanner is not None else 0
     files_seen = int(getattr(scanner, "files_seen", files) or files) if scanner is not None else files
+    hash_done = int(getattr(scanner, "hash_done", 0) or 0) if scanner is not None else hash_done_scan
+    hash_total = int(getattr(scanner, "hash_total", 0) or 0) if scanner is not None else hash_total_scan
+    detect_duplicates = bool(getattr(scanner, "detect_duplicates", False)) if scanner is not None else detect_duplicates_scan
 
     elapsed_total_s = round(max(0.0, now - scan_started), 2) if scan_started else 0.0
     phase_elapsed_s = round(max(0.0, now - phase_started), 2) if phase_started else 0.0
@@ -1034,6 +1085,9 @@ def build_debug_report() -> dict:
         "bytes": bytes_,
         "skipped": skipped,
         "current": current,
+        "detect_duplicates": detect_duplicates,
+        "hash_done": hash_done,
+        "hash_total": hash_total,
         "cancelled": cancelled,
         "error": error or None,
         "elapsed_total_s": elapsed_total_s,
@@ -1048,6 +1102,7 @@ def build_debug_report() -> dict:
             "elapsed_total_s": elapsed_total_s,
             "phase_elapsed_s": phase_elapsed_s,
             "current_phase": phase,
+            "detect_duplicates": detect_duplicates,
         },
     }
 
@@ -1066,11 +1121,14 @@ def reset_scan_fields(scanner=None, folder: str = "", phase: str = "scanning") -
     SCAN["partial"] = None
     SCAN["partial_seq"] = 0
     SCAN["partial_at"] = 0.0
+    SCAN["hash_done"] = 0
+    SCAN["hash_total"] = 0
+    SCAN["detect_duplicates"] = bool(getattr(scanner, "detect_duplicates", False)) if scanner else False
 
 
-def start_scan(path: str) -> None:
+def start_scan(path: str, detect_duplicates: bool = False) -> None:
     folder = clean_dir(path)
-    scanner = Scanner(folder)
+    scanner = Scanner(folder, detect_duplicates=detect_duplicates)
     with LOCK:
         previous = SCAN.get("scanner")
         if previous is not None:
@@ -1465,7 +1523,14 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             body = self.read_json()
             if parsed.path == "/api/scan":
-                start_scan(str(body.get("path") or ""))
+                query = parse_qs(parsed.query)
+                raw_flag = body.get("duplicates")
+                if raw_flag is None and "duplicates" in query:
+                    raw_flag = query.get("duplicates", [None])[0]
+                start_scan(
+                    str(body.get("path") or ""),
+                    detect_duplicates=parse_flag(raw_flag, default=False),
+                )
                 self.send_json({"ok": True})
                 return
             if parsed.path == "/api/cancel":

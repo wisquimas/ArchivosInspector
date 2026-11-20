@@ -51,8 +51,36 @@ header {
 
 .pathbox {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
   margin-top: 10px;
+}
+
+.dup-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #0f141b;
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+
+.dup-opt input {
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.dup-opt:hover {
+  border-color: #6d8298;
+  color: var(--text);
 }
 
 #path, #query, #ageDays {

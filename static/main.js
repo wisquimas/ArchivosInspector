@@ -51,6 +51,7 @@ const scanBtn = document.querySelector("#scanBtn");
 const demoBtn = document.querySelector("#demoBtn");
 const cancelBtn = document.querySelector("#cancelBtn");
 const debugBtn = document.querySelector("#debugBtn");
+const dupCheck = document.querySelector("#dupCheck");
 const statusEl = document.querySelector("#status");
 const quickEl = document.querySelector("#quick");
 const dirsEl = document.querySelector("#dirs");
@@ -434,7 +435,11 @@ function styleKey(node) {
 function setLoading(on, detail = "") {
   if (on) {
     loadingOverlay.hidden = false;
-    loadingOverlay.textContent = detail ? `Cargando… ${detail}` : "Cargando…";
+    if (detail && detail.startsWith("Buscando duplicados")) {
+      loadingOverlay.textContent = detail;
+    } else {
+      loadingOverlay.textContent = detail ? `Cargando… ${detail}` : "Cargando…";
+    }
   } else {
     loadingOverlay.hidden = true;
     loadingOverlay.textContent = "Cargando…";
@@ -540,12 +545,21 @@ async function loadBrowse(path) {
 
 function phaseLabel(phase) {
   if (phase === "measuring") return "midiendo carpeta";
-  if (phase === "hashing") return "duplicados";
+  if (phase === "hashing") return "Buscando duplicados…";
   if (phase === "scanning") return "";
   return "";
 }
 
+function hashingProgress(scan) {
+  const done = Number(scan.hash_done) || 0;
+  const total = Number(scan.hash_total) || 0;
+  if (total > 0) return `Buscando duplicados… ${formatCount(done)} / ${formatCount(total)} grupos`;
+  if (scan.current && String(scan.current).startsWith("Buscando duplicados")) return scan.current;
+  return "Buscando duplicados…";
+}
+
 function loadingDetail(scan) {
+  if (scan.phase === "hashing") return hashingProgress(scan);
   const phase = phaseLabel(scan.phase);
   if (phase) return phase;
   if (scan.files > 0) return `${formatCount(scan.files)} archivos`;
@@ -557,11 +571,12 @@ async function scanPath(path) {
   scanUi.lastPartialSeq = 0;
   setLoading(true);
   statusEl.textContent = "Cargando…";
+  const duplicates = dupCheck?.checked ? 1 : 0;
   try {
     await readJson(await fetch("/api/scan", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({ path, duplicates }),
     }));
   } catch (error) {
     setBusy(false);
@@ -579,10 +594,14 @@ async function poll() {
     if (scan.state === "running") {
       const detail = loadingDetail(scan);
       setLoading(true, detail);
-      const where = scan.current ? ` · ${scan.current}` : "";
-      statusEl.textContent = detail
-        ? `Cargando… ${detail} · ${formatCount(scan.files)} archivos, ${formatBytes(scan.bytes)}${where}`
-        : `Cargando… ${formatCount(scan.files)} archivos, ${formatBytes(scan.bytes)}${where}`;
+      if (scan.phase === "hashing") {
+        statusEl.textContent = detail;
+      } else {
+        const where = scan.current ? ` · ${scan.current}` : "";
+        statusEl.textContent = detail
+          ? `Cargando… ${detail} · ${formatCount(scan.files)} archivos, ${formatBytes(scan.bytes)}${where}`
+          : `Cargando… ${formatCount(scan.files)} archivos, ${formatBytes(scan.bytes)}${where}`;
+      }
       if (scan.partial_seq > scanUi.lastPartialSeq && scan.partial) {
         const first = scanUi.lastPartialSeq === 0;
         scanUi.lastPartialSeq = scan.partial_seq;

@@ -8,12 +8,12 @@ Inspector de disco en mapa 2D y ciudad 3D, al estilo WinDirStat. Explora carpeta
 
 No hace falta tener Python instalado.
 
-1. Entrá a [Releases](https://github.com/wisquimas/ArchivosInspector/releases) y descargá **`ArchivosInspector-Setup-1.3.0.exe`**.
+1. Entrá a [Releases](https://github.com/wisquimas/ArchivosInspector/releases) y descargá **`ArchivosInspector-Setup-1.4.0.exe`**.
 2. Ejecutá el instalador (podés elegir la carpeta; por defecto `Program Files`).
 3. Abrí **Archivos Inspector** desde el menú Inicio (o el acceso directo del escritorio si lo marcaste).
 4. Se abre el navegador en `http://127.0.0.1:…` con la interfaz.
 
-También hay un zip portable: **`ArchivosInspector-Portable-1.3.0.zip`** (descomprimí y ejecutá `ArchivosInspector.exe`).
+También hay un zip portable: **`ArchivosInspector-Portable-1.4.0.zip`** (descomprimí y ejecutá `ArchivosInspector.exe`).
 
 ## Correr desde código
 
@@ -37,6 +37,7 @@ python server.py
 - Mapa de bloques 2D (treemap) por tamaño
 - Vista 3D navegable (órbita, cenital, caminar)
 - Filtros por tipo (video, imagen, código, etc.), duplicados y antigüedad
+- Detección de duplicados **opcional** (desactivada por defecto; más rápida al analizar)
 - Vendor local de Three.js (sin CDN obligatorio)
 - Servidor local de solo lectura en `127.0.0.1`
 - Durante el análisis: **Descargar diagnóstico** (JSON con fases y operaciones lentas) para enviar feedback
@@ -52,8 +53,8 @@ powershell -ExecutionPolicy Bypass -File scripts\build_installer.ps1
 
 El segundo script usa [Inno Setup](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup` si falta). Salida en `release\`:
 
-- `ArchivosInspector-Setup-1.3.0.exe` — instalador
-- `ArchivosInspector-Portable-1.3.0.zip` — carpeta empaquetada
+- `ArchivosInspector-Setup-1.4.0.exe` — instalador
+- `ArchivosInspector-Portable-1.4.0.zip` — carpeta empaquetada
 
 `dist\` y `release\` no se versionan en git; los binarios van en el release de GitHub.
 

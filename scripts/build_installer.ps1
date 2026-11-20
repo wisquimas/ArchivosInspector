@@ -4,7 +4,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
-$Version = "1.3.0"
+$Version = "1.4.0"
 $ExeDir = Join-Path $Root "dist\ArchivosInspector"
 $ExePath = Join-Path $ExeDir "ArchivosInspector.exe"
 $Iss = Join-Path $Root "installer\archivos_inspector.iss"
